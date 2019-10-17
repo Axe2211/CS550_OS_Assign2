@@ -5,6 +5,8 @@
 #include <assert.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 
 //limits
@@ -21,6 +23,9 @@ size_t MAX_LINE_LEN = 10000;
 #define FG_CMD 2
 #define LISTJOBS_STR "listjobs"
 #define LISTJOBS_CMD 3
+#define IO (check_inSymbol() > 0) && (check_outSymbol() > 0)
+#define INPUT (check_inSymbol() > 0) && (check_outSymbol() < 0)
+#define OUTPUT (check_inSymbol() < 0) && (check_outSymbol() > 0)
 
 // process states
 #define RUNNING 0
@@ -37,6 +42,8 @@ static const char *status_string[] = {"RUNNING", "TERMINATED", "STOPPED"};
 FILE *fp; // file struct for stdin
 char **tokens;
 int token_count = 0;
+char ***commands;
+int command_index;
 char *line;
 char *input_file;
 char *output_file;
@@ -104,6 +111,7 @@ void read_command()
 
 	tokenize(line);
 }
+
 
 void handle_exit() 
 {
@@ -195,11 +203,259 @@ int is_background()
 	return (strcmp(tokens[token_count-1], "&") == 0);
 }
 
+int check_symbol(char *symbol, char **token_array, int token_arr_count){
+
+	int index = 0;
+
+	while(index < token_arr_count){
+		if(strcmp(token_array[index], symbol) == 0){
+			break;
+		}
+
+		index = index + 1;
+	}
+
+	if(index < token_arr_count){
+		return index;
+	}
+
+	
+	return 0;
+}
+
+int check_pipe(){
+	int index;
+	char pipe[] = "|\0";
+	if((index = check_symbol(pipe, tokens, token_count)) > 0){
+		return index;
+	}
+
+	return -1;
+}
+
+int check_inSymbol(){
+	int index;
+	char in[] = "<\0";
+	if((index = check_symbol(in, tokens, token_count)) > 0){
+		return index;
+	}
+
+	return -1;
+}
+
+int check_outSymbol(){
+	int index;
+	char out[] = ">\0";
+	if((index = check_symbol(out, tokens, token_count)) > 0){
+		return index;
+	}
+
+	return -1;
+}
+
+int handle_io(){
+	int in_symbol_index, out_symbol_index, ret, status, case_var;
+	pid_t pid;
+	int fds[2];
+
+	if((pid = fork()) < 0){
+		perror("fork failed");
+	}
+
+	if(pid == 0){
+		if(IO){
+			case_var = 0;
+			in_symbol_index = check_inSymbol();
+			out_symbol_index = check_outSymbol();
+			fds[0] = open(tokens[(in_symbol_index + 1)], O_RDONLY);
+			fds[1] = open(tokens[(out_symbol_index + 1)], O_WRONLY);
+			dup2(fds[0], STDIN_FILENO);
+			dup2(fds[1], STDOUT_FILENO);
+			close(fds[0]);
+			close(fds[1]);
+		}
+		if(INPUT){
+			case_var = 1;
+			in_symbol_index = check_inSymbol();
+			fds[0] = open(tokens[(in_symbol_index + 1)], O_RDONLY);
+			dup2(fds[0], STDIN_FILENO);
+			close(fds[0]);
+		}
+		if(OUTPUT){
+			case_var = 2;
+			out_symbol_index = check_outSymbol();
+			fds[1] = open(tokens[(out_symbol_index + 1)], O_WRONLY);
+			dup2(fds[1], STDOUT_FILENO);
+			close(fds[1]);
+		}
+		char **command = malloc(sizeof(char *) * 10);
+		int i = 0, index = 0;
+
+		if(case_var == 0 || case_var == 1){
+			index = in_symbol_index;
+		}
+		else{
+			index = out_symbol_index;
+		}
+
+		while(i < index){
+			command[i] = tokens[i];
+			i = i + 1;
+		}
+		execvp(command[0], command);
+		perror("exec failed in file io redirection");
+		exit(1);
+	}
+	else {
+		if(is_background()) {
+			// record bg task
+			int next_free = next_free_bg();
+			assert(next_free != -1); // we should have checked earlier
+			bgtask[next_free].pid = pid;
+			bgtask[next_free].status = RUNNING;
+			bg_count++;
+		} else {
+			// parent waits on foreground command
+			ret = waitpid(pid, &status, 0);
+			if( ret < 0) {
+				perror("error waiting for child:");
+				return ERROR;
+			}
+		}
+	}
+	return 0;
+}
+
+void prepare_pipe_commands(){
+	
+	int  token_counter = 0;
+	command_index = 0;
+
+	commands = malloc(sizeof(char **) * 10);
+	commands[0] = malloc(sizeof(char **) * 10);
+
+	int i = 0;
+	
+	// preparing the commands such that they are indexed
+	//example for [ ls -l | grep a | wc -l ]: commands[0] -> ls -l   commands[1]-> grep a    commands[2] -> wc -l 
+	while(tokens[i] != NULL){
+		if(strcmp(tokens[i],"|\0") == 0){
+			commands[command_index][token_counter] = NULL;
+			command_index = command_index + 1;
+			commands[command_index] = malloc(sizeof(char **) * 10);
+			token_counter = 0;
+			i = i + 1;
+			continue;
+		}
+
+		commands[command_index][token_counter] = tokens[i];
+		token_counter = token_counter + 1;
+		i = i + 1;
+	}
+}
+
+void reset_commands(){
+	while(command_index > -1){
+		free(commands[command_index]);
+		command_index = command_index - 1;
+	}
+	free(commands);
+	commands = NULL;
+}
+
+int handle_pipe(int command_seq_no, int fd_in){
+	
+	pid_t pid;
+	int fds[2];
+	int ret, status;
+
+	if(command_seq_no == 0){
+		if(commands != NULL){
+			reset_commands();
+		}
+		prepare_pipe_commands();
+	}
+
+	if(command_seq_no == command_index){ //for the last command
+		
+		// fork last child
+		if((pid = fork()) < 0){
+			perror("fork failed");
+			return ERROR;
+		}
+		if(pid == 0){
+			dup2(fd_in, STDIN_FILENO);
+			//close(fd_in);
+			execvp(commands[command_seq_no][0], commands[command_seq_no]);
+			perror("Final command failed\n");
+			return ERROR;
+		}
+		else if(pid > 0){
+			if(is_background()) {
+			// record bg task
+				int next_free = next_free_bg();
+				assert(next_free != -1); // we should have checked earlier
+				bgtask[next_free].pid = pid;
+				bgtask[next_free].status = RUNNING;
+				bg_count++; 
+			} 
+		}
+		
+	}
+	else{
+		//setup pipe
+		if(pipe(fds) < 0){
+			perror("pipe setup failed\n");
+		}
+
+		//fork child
+		if((pid = fork()) < 0){
+			perror("fork failed");
+		}
+
+		// child executes here
+		if(pid == 0){
+			if(fd_in != STDIN_FILENO){     // for commands other than the first command
+				dup2(fd_in, STDIN_FILENO);
+				close(fd_in);
+			}
+			dup2(fds[1], STDOUT_FILENO);
+			close(fds[1]);
+			close(fds[0]);
+			execvp(commands[command_seq_no][0], commands[command_seq_no]);
+			perror("Exec failed on initial or middle commands\n");
+			exit(1);
+		}
+
+		// parent executes here
+		if(pid > 0){
+			ret = waitpid(pid, &status, 0);            // new addition
+			printf("Return value: %d\n",ret);            //
+			if( ret < 0) {                             // 
+				perror("error waiting for child:");    //
+				return ERROR;                          //
+			}                                          //
+			int new_command_seq_no = command_seq_no + 1;
+			handle_pipe(new_command_seq_no, fds[0]);
+			if(is_background()) {
+			// record bg task
+				int next_free = next_free_bg();
+				assert(next_free != -1); // we should have checked earlier
+				bgtask[next_free].pid = pid;
+				bgtask[next_free].status = RUNNING;
+				bg_count++;
+			}
+		}
+
+	}
+
+	return 0;
+}
+
 int run_command() 
 {
+	int pipe_posn, ret = 0, status;
 	pid_t pid;
-	int ret = 0, status;
-
 	// handle builtin commands first
 
 	// exit
@@ -226,39 +482,46 @@ int run_command()
 		return ERROR;
 	}
 
-	// fork child
-	pid = fork();
-	if( pid < 0) {
-		perror("fork failed:");
-		return ERROR;
+	if((pipe_posn = check_pipe()) != -1){
+		handle_pipe(0, STDIN_FILENO);
 	}
+	else if((check_inSymbol() > 0) || (check_outSymbol() > 0)){
+		handle_io();
+	}
+	else{
+		// fork child
+		pid = fork();
+		if( pid < 0) {
+			perror("fork failed:");
+			return ERROR;
+		}
 
-	if(pid==0) {
-		// exec in child
-		//remove & from arguments list if background command
-		if(is_background()) tokens[token_count-1] = NULL; 
+		if(pid==0) {
+			// exec in child
+			//remove & from arguments list if background command
+			if(is_background()) tokens[token_count-1] = NULL;
 
-		execvp(tokens[0], tokens);
-		perror("exec faied:");
-		exit(1);
-	} else {
-		if(is_background()) {
-			// record bg task
-			int next_free = next_free_bg();
-			assert(next_free != -1); // we should have checked earlier
-			bgtask[next_free].pid = pid;
-			bgtask[next_free].status = RUNNING;
-			bg_count++;
+			execvp(tokens[0], tokens);
+			perror("exec faied:");
+			exit(1);
 		} else {
-			// parent waits on foreground command
-			ret = waitpid(pid, &status, 0);
-			if( ret < 0) {
-				perror("error waiting for child:");
-				return ERROR;
+			if(is_background()) {
+				// record bg task
+				int next_free = next_free_bg();
+				assert(next_free != -1); // we should have checked earlier
+				bgtask[next_free].pid = pid;
+				bgtask[next_free].status = RUNNING;
+				bg_count++;
+			} else {
+				// parent waits on foreground command
+				ret = waitpid(pid, &status, 0);
+				if( ret < 0) {
+					perror("error waiting for child:");
+					return ERROR;
+				}
 			}
 		}
 	}
-
 	return 0;
 }
 
